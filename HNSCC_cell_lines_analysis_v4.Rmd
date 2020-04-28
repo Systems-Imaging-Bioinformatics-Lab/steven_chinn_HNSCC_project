@@ -1,0 +1,634 @@
+---
+title: "HNSCC_cell_lines_analysis_v4"
+output:
+  html_document:
+    df_print: paged
+date: "`r format(Sys.time(), '%B %Y')`"
+---
+
+Notes:
+- analysis only on cell line samples (double pos and neg) (103 and 122)
+
+# Main Analysis
+## SETUP 
+```{r}
+# umap
+library(reticulate)
+py_config()
+import("umap")
+
+# Load in libraries
+library(Seurat)
+library(dplyr)
+library(tibble)
+library(pheatmap)
+library(RColorBrewer)
+library(scales)
+library(data.table)
+library(Matrix)
+library(harmony)
+
+# parallelization
+library(future)
+plan("multiprocess", workers = 3)
+options(future.globals.maxSize = 2000 * 1024^2)
+plan()
+
+```
+
+```{r}
+# Load in cell cycle genes
+s_genes <- cc.genes$s.genes
+g2m_genes <- cc.genes$g2m.genes
+```
+
+```{r}
+# Load in raw gene expression matrices 
+# run in console not chunk
+HNSCC_103_neg.data <- Read10X("NovaA-167/UMSCC103_neg/filtered_feature_bc_matrix/")
+HNSCC_103_pos.data <- Read10X("NovaA-167/UMSCC103_pos/filtered_feature_bc_matrix/")
+HNSCC_122_neg.data <- Read10X("NovaA-167/UMSCC122_neg/filtered_feature_bc_matrix/")
+HNSCC_122_pos.data <- Read10X("NovaA-167/UMSCC122_pos/filtered_feature_bc_matrix/")
+```
+
+```{r}
+# create Seurat obejcts
+HNSCC_103_neg <- CreateSeuratObject(counts = HNSCC_103_neg.data, project = 'neg_103', min.cells = 3, min.features = 100)
+HNSCC_103_pos <- CreateSeuratObject(counts = HNSCC_103_pos.data, project = 'pos_103', min.cells = 3, min.features = 100)
+HNSCC_122_neg <- CreateSeuratObject(counts = HNSCC_122_neg.data, project = 'neg_122', min.cells = 3, min.features = 100)
+HNSCC_122_pos <- CreateSeuratObject(counts = HNSCC_122_pos.data, project = 'pos_122', min.cells = 3, min.features = 100)
+
+# merge objects together and rename cells
+HNSCC_cell_line_merge <- merge(x = HNSCC_103_neg, y = c(HNSCC_103_pos, HNSCC_122_neg, HNSCC_122_pos), 
+                     add.cell.ids = c('103_neg', '103_pos', '122_neg', '122_pos'))
+
+```
+
+```{r}
+# Add meta.data needed
+# get number of cells for each sample
+n_cells <- c(length(grep('^103_neg', colnames(HNSCC_cell_line_merge))), length(grep('^103_pos', colnames(HNSCC_cell_line_merge))),
+             length(grep('^122_neg', colnames(HNSCC_cell_line_merge))), length(grep('^122_pos', colnames(HNSCC_cell_line_merge))))
+
+metadata <- data.frame(run = rep(c('167', '167', '167', '167'), times = n_cells),
+                       state = rep(c('neg', 'pos', 'neg', 'pos'), times = n_cells),
+                       ID = rep(c('103', '103', '122', '122'), times = n_cells), 
+                       row.names = colnames(HNSCC_cell_line_merge), stringsAsFactors = F)
+
+# add metadata to merged object
+HNSCC_cell_line_merge <- AddMetaData(HNSCC_cell_line_merge, metadata = metadata)
+
+```
+
+```{r}
+# Save raw object 
+# Run in console not chunk
+save(HNSCC_cell_line_merge, file = 'HNSCC_cell_line_merge_v4_raw_011620.RData')
+
+# Remove objects by environment (OPTIONAL)
+```
+
+
+# PREPROCESSING
+## QC/Filtering
+```{r}
+# get percent of mitochondrial genes reads
+HNSCC_cell_line_merge$percent.mt <- PercentageFeatureSet(object = HNSCC_cell_line_merge, pattern = "^MT-")
+
+# Look at nFeature, nCount, percent.mt
+VlnPlot(object = HNSCC_cell_line_merge, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3,
+        pt.size = .5)
+
+plot1 <- FeatureScatter(object = HNSCC_cell_line_merge, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(object = HNSCC_cell_line_merge, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+CombinePlots(plots = list(plot1, plot2))
+```
+
+```{r}
+# Filter cells
+HNSCC_cell_line_merge <- subset(x = HNSCC_cell_line_merge, subset = nCount_RNA < 2e+05 & nFeature_RNA < 11000 & percent.mt < 12.5)
+```
+
+## Normalization
+```{r}
+# Normalize merged data
+HNSCC_cell_line_merge <- NormalizeData(object = HNSCC_cell_line_merge, normalization.method = "LogNormalize", 
+                             scale.factor = 10000)
+```
+
+## Variable Feature Selection
+```{r}
+# Find variable features
+HNSCC_cell_line_merge <- FindVariableFeatures(object = HNSCC_cell_line_merge, selection.method = 'vst', loess.span = .3,
+                                    nfeatures = 2000)
+top10 <- head(x = VariableFeatures(object = HNSCC_cell_line_merge), 10)
+
+plot1 <- VariableFeaturePlot(object = HNSCC_cell_line_merge)
+plot2 <- LabelPoints(plot = plot1, points = top10)
+CombinePlots(plots = list(plot1, plot2))
+```
+
+## Scaling
+```{r}
+# Scale the data
+all.genes <- rownames(HNSCC_cell_line_merge)
+# use if want all cell cycle signals regressed out
+HNSCC_cell_line_merge <- CellCycleScoring(object = HNSCC_cell_line_merge, s.features = s_genes, g2m.features = g2m_genes, set.ident = TRUE)
+HNSCC_cell_line_merge <- ScaleData(object = HNSCC_cell_line_merge, features = all.genes, 
+                         vars.to.regress = c("nCount_RNA", "nFeature_RNA", "percent.mt", "S.Score", "G2M.Score"))
+
+```
+
+## PCA
+```{r}
+# Can control the number of pcs that you want to calculate w/ npcs
+HNSCC_cell_line_merge <- RunPCA(object = HNSCC_cell_line_merge, features = VariableFeatures(object = HNSCC_cell_line_merge), 
+                      nfeatures.print = 5)
+
+# Choosing how many PCs for clustering
+# visualizing pcs
+ElbowPlot(object = HNSCC_cell_line_merge, ndims = 50)
+
+# Calculating --> until get over 90% variance
+stdev <- HNSCC_cell_line_merge[['pca']]@stdev
+var <- (HNSCC_cell_line_merge[['pca']]@stdev)^2
+sum(var[1:31])/sum(var) 
+
+pc_n <- 31
+```
+
+## Batch Correction
+```{r}
+# Batch correction with Harmony
+HNSCC_cell_line_merge <- RunHarmony(HNSCC_cell_line_merge, group.by.vars = c('ID'), dims.use = 1:pc_n, verbose = F)
+```
+
+## Clustering
+```{r}
+HNSCC_cell_line_merge <- FindNeighbors(object = HNSCC_cell_line_merge, dims = 1:pc_n, k.param = 20, reduction = 'harmony')
+HNSCC_cell_line_merge <- FindClusters(object = HNSCC_cell_line_merge, resolution = 0.5)
+```
+
+## UMAP
+```{r}
+HNSCC_cell_line_merge <- RunUMAP(HNSCC_cell_line_merge, dims = 1:pc_n, reduction = 'harmony')
+DimPlot(object = HNSCC_cell_line_merge, reduction = 'umap')
+```
+
+```{r}
+# Save filtered object
+# Run in console not chunk
+save(HNSCC_cell_line_merge, file = 'HNSCC_cell_line_merge_v4_filtered_012020.RData')
+```
+
+
+# DOWNSTREAM ANALYSIS
+## More UMAP visualizations
+```{r}
+DimPlot(object = HNSCC_cell_line_merge, reduction = 'umap', label = T, label.size = 5)
+DimPlot(object = HNSCC_cell_line_merge, reduction = 'umap', group.by = 'run')
+DimPlot(object = HNSCC_cell_line_merge, reduction = 'umap', split.by = 'state')
+DimPlot(object = HNSCC_cell_line_merge, reduction = 'umap', split.by = 'ID')
+```
+
+## Cell type annotation
+```{r}
+# DE
+HNSCC_cell_line_DE <- FindAllMarkers(object = HNSCC_cell_line_merge, only.pos = T, test.use = 'LR', latent.vars = 'ID')
+HNSCC_cell_line_DE <- HNSCC_cell_line_DE[which(HNSCC_cell_line_DE$p_val_adj < .05),]
+HNSCC_cell_line_DE <- HNSCC_cell_line_DE[order(HNSCC_cell_line_DE$cluster,HNSCC_cell_line_DE$p_val_adj, HNSCC_cell_line_DE$avg_logFC),]
+fwrite(HNSCC_cell_line_DE, file = 'HNSCC_cell_line_DE_clusters_annote_batch_012020.csv') # run in console
+```
+
+```{r}
+# DE - state
+HNSCC_cell_line_state_DE <- FindMarkers(HNSCC_cell_line_merge, ident.1 = 'pos', ident.2 = 'neg', group.by = 'state', test.use = 'LR', latent.vars = 'ID')
+fwrite(HNSCC_cell_line_state_DE, file = 'HNSCC_cell_line_DE_state_batch_012020.csv', row.names = T) # run in console
+```
+
+## Cell Scoring
+### All cell lines
+#### Epithelial
+```{r}
+epi_markers <- read.csv('HNSCC/epithelial_scoring/group-1109.csv', header = T, stringsAsFactors = F, skip = 1)
+epi_markers <- epi_markers$Approved.symbol
+epi_markers <- c(epi_markers, 'EPCAM', 'SFN')
+
+all_genes <- rownames(HNSCC_cell_line_merge)
+all_genes[sort(grep('^KRT', all_genes))]
+
+epi_markers <- epi_markers[epi_markers %in% all_genes]
+
+# expression: E = log2(avg(cells for gene i)) 
+cell_data <- FetchData(HNSCC_cell_line_merge, vars = c('ident', epi_markers))
+
+Ea <- apply(cell_data[,-1], 2, function(x) log2(mean(x) + 1))
+summary(Ea)
+expressed_epi_markers <- names(Ea)[Ea > .05]
+
+# correlation
+## KRT36 and KRT72 have std = 0
+## KRT14, KRT15, KRT16, KRT17, KRT6A, KRT8, SFN, KRT5 are highly correlated (> 0.8)
+epi_markers_cor <- cor(cell_data[-1])
+corrplot(abs(epi_markers_cor) > .6, diag = F)
+
+expressed_cor_epi_markers <- expressed_epi_markers[!expressed_epi_markers %in% c('KRT14', 'KRT15', 'KRT16', 'KRT17', 'KRT6A', 'KRT8', 'SFN', 'KRT5')]
+
+cell_data_norm <- FetchData(HNSCC_cell_line_merge, vars = c(expressed_cor_epi_markers, 'ident'))
+cell_data_norm <- cell_data_norm[order(cell_data_norm$ident),]
+
+cell_data_norm$score <- rowSums(cell_data_norm[,-ncol(cell_data_norm)]) / (ncol(cell_data_norm)-1)
+summary(cell_data_norm$score)
+sum(cell_data_norm$score > 1)
+cell_data_norm <- cell_data_norm[order(cell_data_norm$score, decreasing = T),]
+
+anno <- data.frame(cluster = cell_data_norm$ident)
+rownames(anno) <- rownames(cell_data_norm)
+cell_data_norm_scale <- apply(cell_data_norm[,1:(ncol(cell_data_norm)-2)], MARGIN = 2, FUN = function(x) (squish(x, range = c(-2,2))))
+pheatmap(t(cell_data_norm_scale), cluster_rows = F, cluster_cols = F, show_colnames = F, annotation_col = anno, color = heat.colors(250, rev = T))
+
+unique(cell_data_norm$ident)
+table(HNSCC_cell_line_merge$seurat_clusters)
+
+cell_data_norm %>% ggplot(aes(ident, score)) + geom_boxplot() + theme_classic()
+```
+
+#### EMT
+```{r}
+emt_markers <- c('HIF1A', 'SNAI1', 'SNAI2', 'TWIST1', 'ZEB2', 'ZEB1', 'KLK6', 'BMI1', 'VIM', 'CDH2', 'FN1', 'CD99L2', 'ITGA5', 'EMP3', 'CDH1')
+
+cell_data <- FetchData(HNSCC_cell_line_merge, vars = c('ident', emt_markers))
+
+Ea <- apply(cell_data[,-1], 2, function(x) log2(mean(x) + 1))
+summary(Ea)
+expressed_emt_markers <- names(Ea)[Ea > .05]
+
+# correlation
+## KLK6 has std = 0
+emt_markers_cor <- cor(cell_data[-1])
+corrplot(emt_markers_cor, diag = F)
+
+expressed_cor_emt_markers <- expressed_emt_markers
+
+cell_data_norm <- FetchData(HNSCC_cell_line_merge, vars = c(expressed_cor_emt_markers, 'ident'))
+cell_data_norm <- cell_data_norm[order(cell_data_norm$ident),]
+
+cell_data_norm$score <- rowSums(cell_data_norm[,-ncol(cell_data_norm)]) / (ncol(cell_data_norm)-1)
+summary(cell_data_norm$score)
+sum(cell_data_norm$score > 1)
+cell_data_norm <- cell_data_norm[order(cell_data_norm$score, decreasing = T),]
+
+anno <- data.frame(cluster = cell_data_norm$ident)
+rownames(anno) <- rownames(cell_data_norm)
+cell_data_norm_scale <- apply(cell_data_norm[,1:(ncol(cell_data_norm)-2)], MARGIN = 2, FUN = function(x) (squish(x, range = c(-2,2))))
+pheatmap(t(cell_data_norm_scale), cluster_rows = F, cluster_cols = F, show_colnames = F, annotation_col = anno, color = heat.colors(250, rev = T))
+
+unique(cell_data_norm$ident)
+table(HNSCC_cell_line_merge$seurat_clusters)
+
+cell_data_norm %>% ggplot(aes(ident, score)) + geom_boxplot() + theme_classic()
+```
+
+#### Stem Cell
+```{r}
+## change: OCT4 = POU5f1, CD133 = PROM1, INK4 = CDKN2A, CMET = MET, MDR1 = ABCB1, CD271 = NGFR
+## no CD24, NANOG, PROM1, ABCB1
+sc_markers <- c('BMI1', 'CD44', 'ALDH1A1', 'ALDH1A3', 'ABCG2', 'SOX2', 'POU5F1', 'HOXA4', 'HOXA9', 
+                'HOXD10', 'CDKN2A', 'MET', 'CTNNB1', 'KLF4', 'HIF1A', 'TERT', 'NGFR', 'PDPN')
+sc_markers[sc_markers %in% all_genes]
+
+cell_data <- FetchData(HNSCC_cell_line_merge, vars = c('ident', sc_markers))
+
+Ea <- apply(cell_data[,-1], 2, function(x) log2(mean(x) + 1))
+summary(Ea)
+expressed_sc_markers <- names(Ea)[Ea > .05]
+
+# correlation
+## no genes are highly correlated with each other
+sc_markers_cor <- cor(cell_data[-1])
+corrplot(sc_markers_cor, diag = F)
+
+expressed_cor_sc_markers <- expressed_sc_markers
+
+cell_data_norm <- FetchData(HNSCC_cell_line_merge, vars = c(expressed_cor_sc_markers, 'ident'))
+cell_data_norm <- cell_data_norm[order(cell_data_norm$ident),]
+
+cell_data_norm$score <- rowSums(cell_data_norm[,-ncol(cell_data_norm)]) / (ncol(cell_data_norm)-1)
+summary(cell_data_norm$score)
+sum(cell_data_norm$score > 1)
+cell_data_norm <- cell_data_norm[order(cell_data_norm$score, decreasing = T),]
+
+anno <- data.frame(cluster = cell_data_norm$ident)
+rownames(anno) <- rownames(cell_data_norm)
+cell_data_norm_scale <- apply(cell_data_norm[,1:(ncol(cell_data_norm)-2)], MARGIN = 2, FUN = function(x) (squish(x, range = c(-2,2))))
+pheatmap(t(cell_data_norm_scale), cluster_rows = F, cluster_cols = F, show_colnames = F, annotation_col = anno, color = heat.colors(250, rev = T))
+
+unique(cell_data_norm$ident)
+table(HNSCC_cell_line_merge$seurat_clusters)
+
+cell_data_norm %>% ggplot(aes(ident, score)) + geom_boxplot() + theme_classic()
+```
+
+### Only Cell Line 103
+```{r}
+Idents(HNSCC_cell_line_merge) <- 'ID'
+HNSCC_cell_line_103 <- subset(HNSCC_cell_line_merge, idents = '103')
+Idents(HNSCC_cell_line_103) <- 'seurat_clusters'
+```
+
+#### Epithelial
+```{r}
+epi_markers <- read.csv('HNSCC/epithelial_scoring/group-1109.csv', header = T, stringsAsFactors = F, skip = 1)
+epi_markers <- epi_markers$Approved.symbol
+epi_markers <- c(epi_markers, 'EPCAM', 'SFN')
+
+all_genes <- rownames(HNSCC_cell_line_103)
+all_genes[sort(grep('^KRT', all_genes))]
+
+epi_markers <- epi_markers[epi_markers %in% all_genes]
+
+# expression: E = log2(avg(cells for gene i)) 
+cell_data <- FetchData(HNSCC_cell_line_103, vars = c('ident', epi_markers))
+
+Ea <- apply(cell_data[,-1], 2, function(x) log2(mean(x) + 1))
+summary(Ea)
+expressed_epi_markers <- names(Ea)[Ea > .05]
+
+# correlation
+## KRT36 and KRT72 have std = 0
+## KRT14, KRT18, KRT6A, KRT8, KRT5 are highly correlated (> 0.8)
+epi_markers_cor <- cor(cell_data[-1])
+corrplot(abs(epi_markers_cor) > .6, diag = F)
+
+expressed_cor_epi_markers <- expressed_epi_markers[!expressed_epi_markers %in% c('KRT14', 'KRT18', 'KRT6A', 'KRT8', 'KRT5')]
+
+cell_data_norm <- FetchData(HNSCC_cell_line_103, vars = c(expressed_cor_epi_markers, 'ident'))
+cell_data_norm <- cell_data_norm[order(cell_data_norm$ident),]
+
+cell_data_norm$score <- rowSums(cell_data_norm[,-ncol(cell_data_norm)]) / (ncol(cell_data_norm)-1)
+summary(cell_data_norm$score)
+sum(cell_data_norm$score > 1)
+cell_data_norm <- cell_data_norm[order(cell_data_norm$score, decreasing = T),]
+
+anno <- data.frame(cluster = cell_data_norm$ident)
+rownames(anno) <- rownames(cell_data_norm)
+cell_data_norm_scale <- apply(cell_data_norm[,1:(ncol(cell_data_norm)-2)], MARGIN = 2, FUN = function(x) (squish(x, range = c(-2,2))))
+pheatmap(t(cell_data_norm_scale), cluster_rows = F, cluster_cols = F, show_colnames = F, annotation_col = anno, color = heat.colors(250, rev = T))
+
+unique(cell_data_norm$ident)
+table(HNSCC_cell_line_103$seurat_clusters)
+
+cell_data_norm %>% ggplot(aes(ident, score)) + geom_boxplot() + theme_classic()
+```
+
+#### EMT
+```{r}
+emt_markers <- c('HIF1A', 'SNAI1', 'SNAI2', 'TWIST1', 'ZEB2', 'ZEB1', 'KLK6', 'BMI1', 'VIM', 'CDH2', 'FN1', 'CD99L2', 'ITGA5', 'EMP3', 'CDH1')
+
+cell_data <- FetchData(HNSCC_cell_line_103, vars = c('ident', emt_markers))
+
+Ea <- apply(cell_data[,-1], 2, function(x) log2(mean(x) + 1))
+summary(Ea)
+expressed_emt_markers <- names(Ea)[Ea > .05]
+
+# correlation
+## KLK6 has std = 0
+emt_markers_cor <- cor(cell_data[-1])
+corrplot(emt_markers_cor, diag = F)
+
+expressed_cor_emt_markers <- expressed_emt_markers
+
+cell_data_norm <- FetchData(HNSCC_cell_line_103, vars = c(expressed_cor_emt_markers, 'ident'))
+cell_data_norm <- cell_data_norm[order(cell_data_norm$ident),]
+
+cell_data_norm$score <- rowSums(cell_data_norm[,-ncol(cell_data_norm)]) / (ncol(cell_data_norm)-1)
+summary(cell_data_norm$score)
+sum(cell_data_norm$score > 1)
+cell_data_norm <- cell_data_norm[order(cell_data_norm$score, decreasing = T),]
+
+anno <- data.frame(cluster = cell_data_norm$ident)
+rownames(anno) <- rownames(cell_data_norm)
+cell_data_norm_scale <- apply(cell_data_norm[,1:(ncol(cell_data_norm)-2)], MARGIN = 2, FUN = function(x) (squish(x, range = c(-2,2))))
+pheatmap(t(cell_data_norm_scale), cluster_rows = F, cluster_cols = F, show_colnames = F, annotation_col = anno, color = heat.colors(250, rev = T))
+
+unique(cell_data_norm$ident)
+table(HNSCC_cell_line_103$seurat_clusters)
+
+cell_data_norm %>% ggplot(aes(ident, score)) + geom_boxplot() + theme_classic()
+```
+
+#### Stem Cell
+```{r}
+## change: OCT4 = POU5f1, CD133 = PROM1, INK4 = CDKN2A, CMET = MET, MDR1 = ABCB1, CD271 = NGFR
+## no CD24, NANOG, PROM1, ABCB1
+sc_markers <- c('BMI1', 'CD44', 'ALDH1A1', 'ALDH1A3', 'ABCG2', 'SOX2', 'POU5F1', 'HOXA4', 'HOXA9', 
+                'HOXD10', 'CDKN2A', 'MET', 'CTNNB1', 'KLF4', 'HIF1A', 'TERT', 'NGFR', 'PDPN')
+sc_markers[sc_markers %in% all_genes]
+
+cell_data <- FetchData(HNSCC_cell_line_103, vars = c('ident', sc_markers))
+
+Ea <- apply(cell_data[,-1], 2, function(x) log2(mean(x) + 1))
+summary(Ea)
+expressed_sc_markers <- names(Ea)[Ea > .05]
+
+# correlation
+## no genes are highly correlated with each other
+sc_markers_cor <- cor(cell_data[-1])
+corrplot(sc_markers_cor, diag = F)
+
+expressed_cor_sc_markers <- expressed_sc_markers
+
+cell_data_norm <- FetchData(HNSCC_cell_line_103, vars = c(expressed_cor_sc_markers, 'ident'))
+cell_data_norm <- cell_data_norm[order(cell_data_norm$ident),]
+
+cell_data_norm$score <- rowSums(cell_data_norm[,-ncol(cell_data_norm)]) / (ncol(cell_data_norm)-1)
+summary(cell_data_norm$score)
+sum(cell_data_norm$score > 1)
+cell_data_norm <- cell_data_norm[order(cell_data_norm$score, decreasing = T),]
+
+anno <- data.frame(cluster = cell_data_norm$ident)
+rownames(anno) <- rownames(cell_data_norm)
+cell_data_norm_scale <- apply(cell_data_norm[,1:(ncol(cell_data_norm)-2)], MARGIN = 2, FUN = function(x) (squish(x, range = c(-2,2))))
+pheatmap(t(cell_data_norm_scale), cluster_rows = F, cluster_cols = F, show_colnames = F, annotation_col = anno, color = heat.colors(250, rev = T))
+
+unique(cell_data_norm$ident)
+table(HNSCC_cell_line_103$seurat_clusters)
+
+cell_data_norm %>% ggplot(aes(ident, score)) + geom_boxplot() + theme_classic()
+```
+
+### Only Cell Line 122
+```{r}
+Idents(HNSCC_cell_line_merge) <- 'ID'
+HNSCC_cell_line_122 <- subset(HNSCC_cell_line_merge, idents = '122')
+Idents(HNSCC_cell_line_122) <- 'seurat_clusters'
+```
+
+#### Epithelial
+```{r}
+epi_markers <- read.csv('HNSCC/epithelial_scoring/group-1109.csv', header = T, stringsAsFactors = F, skip = 1)
+epi_markers <- epi_markers$Approved.symbol
+epi_markers <- c(epi_markers, 'EPCAM', 'SFN')
+
+all_genes <- rownames(HNSCC_cell_line_122)
+all_genes[sort(grep('^KRT', all_genes))]
+
+epi_markers <- epi_markers[epi_markers %in% all_genes]
+
+# expression: E = log2(avg(cells for gene i)) 
+cell_data <- FetchData(HNSCC_cell_line_122, vars = c('ident', epi_markers))
+
+Ea <- apply(cell_data[,-1], 2, function(x) log2(mean(x) + 1))
+summary(Ea)
+expressed_epi_markers <- names(Ea)[Ea > .05]
+
+# correlation
+## Many have std=0
+## KRT16, KRT17, KRT8 are highly correlated (> 0.6)
+epi_markers_cor <- cor(cell_data[-1])
+corrplot(abs(epi_markers_cor) > .6, diag = F)
+
+x <- c('KRT24', 'KRT27', 'KRT36', 'KRT1', 'KRT3', 'KRT4', 'KRT6C', 'KRT74', 'KRT78', 'KRT79', 'KRT82',
+       'KRT85', 'KRT16', 'KRT17', 'KRT8')
+expressed_cor_epi_markers <- expressed_epi_markers[!expressed_epi_markers %in% x]
+
+cell_data_norm <- FetchData(HNSCC_cell_line_122, vars = c(expressed_cor_epi_markers, 'ident'))
+cell_data_norm <- cell_data_norm[order(cell_data_norm$ident),]
+
+cell_data_norm$score <- rowSums(cell_data_norm[,-ncol(cell_data_norm)]) / (ncol(cell_data_norm)-1)
+summary(cell_data_norm$score)
+sum(cell_data_norm$score > 1)
+cell_data_norm <- cell_data_norm[order(cell_data_norm$score, decreasing = T),]
+
+anno <- data.frame(cluster = cell_data_norm$ident)
+rownames(anno) <- rownames(cell_data_norm)
+cell_data_norm_scale <- apply(cell_data_norm[,1:(ncol(cell_data_norm)-2)], MARGIN = 2, FUN = function(x) (squish(x, range = c(-2,2))))
+pheatmap(t(cell_data_norm_scale), cluster_rows = F, cluster_cols = F, show_colnames = F, annotation_col = anno, color = heat.colors(250, rev = T))
+
+unique(cell_data_norm$ident)
+table(HNSCC_cell_line_122$seurat_clusters)
+
+cell_data_norm %>% ggplot(aes(ident, score)) + geom_boxplot() + theme_classic()
+```
+
+#### EMT
+```{r}
+emt_markers <- c('HIF1A', 'SNAI1', 'SNAI2', 'TWIST1', 'ZEB2', 'ZEB1', 'KLK6', 'BMI1', 'VIM', 'CDH2', 'FN1', 'CD99L2', 'ITGA5', 'EMP3', 'CDH1')
+
+cell_data <- FetchData(HNSCC_cell_line_122, vars = c('ident', emt_markers))
+
+Ea <- apply(cell_data[,-1], 2, function(x) log2(mean(x) + 1))
+summary(Ea)
+expressed_emt_markers <- names(Ea)[Ea > .05]
+
+# correlation
+## KLK6 has std = 0
+emt_markers_cor <- cor(cell_data[-1])
+corrplot(emt_markers_cor, diag = F)
+
+expressed_cor_emt_markers <- expressed_emt_markers
+
+cell_data_norm <- FetchData(HNSCC_cell_line_122, vars = c(expressed_cor_emt_markers, 'ident'))
+cell_data_norm <- cell_data_norm[order(cell_data_norm$ident),]
+
+cell_data_norm$score <- rowSums(cell_data_norm[,-ncol(cell_data_norm)]) / (ncol(cell_data_norm)-1)
+summary(cell_data_norm$score)
+sum(cell_data_norm$score > 1)
+cell_data_norm <- cell_data_norm[order(cell_data_norm$score, decreasing = T),]
+
+anno <- data.frame(cluster = cell_data_norm$ident)
+rownames(anno) <- rownames(cell_data_norm)
+cell_data_norm_scale <- apply(cell_data_norm[,1:(ncol(cell_data_norm)-2)], MARGIN = 2, FUN = function(x) (squish(x, range = c(-2,2))))
+pheatmap(t(cell_data_norm_scale), cluster_rows = F, cluster_cols = F, show_colnames = F, annotation_col = anno, color = heat.colors(250, rev = T))
+
+unique(cell_data_norm$ident)
+table(HNSCC_cell_line_122$seurat_clusters)
+
+cell_data_norm %>% ggplot(aes(ident, score)) + geom_boxplot() + theme_classic()
+```
+
+#### Stem Cell
+```{r}
+## change: OCT4 = POU5f1, CD133 = PROM1, INK4 = CDKN2A, CMET = MET, MDR1 = ABCB1, CD271 = NGFR
+## no CD24, NANOG, PROM1, ABCB1
+sc_markers <- c('BMI1', 'CD44', 'ALDH1A1', 'ALDH1A3', 'ABCG2', 'SOX2', 'POU5F1', 'HOXA4', 'HOXA9', 
+                'HOXD10', 'CDKN2A', 'MET', 'CTNNB1', 'KLF4', 'HIF1A', 'TERT', 'NGFR', 'PDPN')
+sc_markers[sc_markers %in% all_genes]
+
+cell_data <- FetchData(HNSCC_cell_line_122, vars = c('ident', sc_markers))
+
+Ea <- apply(cell_data[,-1], 2, function(x) log2(mean(x) + 1))
+summary(Ea)
+expressed_sc_markers <- names(Ea)[Ea > .05]
+
+# correlation
+## no genes are highly correlated with each other
+sc_markers_cor <- cor(cell_data[-1])
+corrplot(sc_markers_cor, diag = F)
+
+expressed_cor_sc_markers <- expressed_sc_markers
+
+cell_data_norm <- FetchData(HNSCC_cell_line_122, vars = c(expressed_cor_sc_markers, 'ident'))
+cell_data_norm <- cell_data_norm[order(cell_data_norm$ident),]
+
+cell_data_norm$score <- rowSums(cell_data_norm[,-ncol(cell_data_norm)]) / (ncol(cell_data_norm)-1)
+summary(cell_data_norm$score)
+sum(cell_data_norm$score > 1)
+cell_data_norm <- cell_data_norm[order(cell_data_norm$score, decreasing = T),]
+
+anno <- data.frame(cluster = cell_data_norm$ident)
+rownames(anno) <- rownames(cell_data_norm)
+cell_data_norm_scale <- apply(cell_data_norm[,1:(ncol(cell_data_norm)-2)], MARGIN = 2, FUN = function(x) (squish(x, range = c(-2,2))))
+pheatmap(t(cell_data_norm_scale), cluster_rows = F, cluster_cols = F, show_colnames = F, annotation_col = anno, color = heat.colors(250, rev = T))
+
+unique(cell_data_norm$ident)
+table(HNSCC_cell_line_122$seurat_clusters)
+
+cell_data_norm %>% ggplot(aes(ident, score)) + geom_boxplot() + theme_classic()
+```
+
+# Additional Analysis
+## 4/13/20
+```{r}
+anno_colors <- list(cluster = c(neg = '#f8766d', pos = '#0ec3c7'))
+
+# pos vs. neg heatmap on cell lines
+HNSCC_cell_line_DE_state_top10 <- HNSCC_cell_line_state_DE %>% rownames_to_column() %>% top_n(n = 10, wt = avg_logFC) %>%
+  column_to_rownames()
+HNSCC_cell_line_DE_state_top20 <- HNSCC_cell_line_state_DE %>% rownames_to_column() %>% top_n(n = 20, wt = avg_logFC) %>%
+  column_to_rownames()
+
+cells <- FetchData(object = HNSCC_cell_line_merge, vars = c(unique(rownames(HNSCC_cell_line_DE_state_top20)), 'state'))
+cells <- cells %>% rownames_to_column() %>% arrange(desc(state)) %>% column_to_rownames()
+
+anno <- data.frame(cluster = cells$state)
+rownames(anno) <- rownames(cells)
+
+cells <- apply(cells[,1:(ncol(cells)-1)], MARGIN = 2, FUN = function(x) (squish(x, range = c(-2.5,2.5))))
+
+pheatmap(mat = t(cells), show_colnames = F, cluster_rows = F, cluster_col = F, annotation_col = anno, fontsize = 7,
+         color = colorRampPalette(colors = c('#0433FF','#000000','#FFFF00'))(250), border_color = NA,
+         annotation_colors = anno_colors)
+
+```
+
+## 4/21/20
+```{r}
+# Proportions of cell lines in cell lines
+HNSCC_cell_line_state_cluster_prop <- table(HNSCC_cell_line_merge$state, HNSCC_cell_line_merge$seurat_clusters)
+
+# Top 10 genes Cluster Heatmaps (cell lines)
+HNSCC_cell_line_DE_top10 <- HNSCC_cell_line_DE %>% group_by(cluster) %>% top_n(10, wt = avg_logFC)
+cells <- FetchData(object = HNSCC_cell_line_merge, vars = c(unique(HNSCC_cell_line_DE_top10$gene), 'seurat_clusters'))
+cells <- cells %>% rownames_to_column() %>% arrange(seurat_clusters) %>% column_to_rownames()
+
+anno <- data.frame(cluster = cells$seurat_clusters)
+rownames(anno) <- rownames(cells)
+
+cells <- apply(cells[,1:(ncol(cells)-1)], MARGIN = 2, FUN = function(x) (squish(x, range = c(-2.5,2.5))))
+
+pheatmap(mat = t(cells), show_colnames = F, cluster_rows = F, cluster_col = F, annotation_col = anno, fontsize = 7,
+         color = colorRampPalette(colors = c('#0433FF','#000000','#FFFF00'))(250), border_color = NA)
+
+```
+

@@ -1,0 +1,45 @@
+scRNA HNSCC Primary Tumors Analysis 
+
+Data:
+	5 primary tumors
+		positive and negative for CD44 and ALDH1A1
+
+when merging samples together:
+	keep:
+		1) genes that are detected in at least 3 cells
+		2) cells that contain at least 100 genes
+
+when filtering cells:
+	keep cells that:
+		1) nCount/nUMI < 50000
+		2) nFeature/nGene < 6250
+		3) percent of mitocondrial genes < 30% (25%)
+
+normalize by:
+	ln((gene counts for each cell / total counts for that cell) * 10000)
+
+get variable features:
+	top 2000
+	used later for PCA
+
+scale by:
+	all genes/features
+	mean expression across cells = 0 and variance = 1
+	regress nCount/nUMI, nFeature/nGene, percent of mitochondrial genes, cell cycle
+
+pca:
+	picked first 32 PCs (explain 90% variance)
+
+batch correction (harmony):
+	batch corrected on runs (5 different runs)
+	theta = 2 (diversity clustering penalty)
+	lambda = 1 (ridge regression penalty)
+	sigma = 0.1 (width of soft kmeans clusters)
+
+clustering 
+	1) FindNeighbors: make SNN graph (calculate k-nearest neighbors for each cell and use to calculate neighborhood overlap/Jaccard index b/t every cell k param nearest neighbors)
+		k = 20
+	2) FindClusters: use SNN modularity optimization based clustering algorithm 
+		resolution = .8 (number of communities)
+
+

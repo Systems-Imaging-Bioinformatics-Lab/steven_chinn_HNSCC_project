@@ -1,0 +1,233 @@
+---
+title: "scRNA HNSCC Primary and Cell Lines Analysis"
+output:
+  html_document:
+    df_print: paged
+date: "`r format(Sys.time(), '%B %Y')`"
+---
+
+Notes:
+- Include four more samples, which are cell line samples (double negative and positive)
+
+# SETUP 
+```{r}
+# umap
+library(reticulate)
+py_config()
+import("umap")
+
+# Load in libraries
+library(Seurat)
+library(dplyr)
+library(tibble)
+library(pheatmap)
+library(RColorBrewer)
+library(scales)
+library(data.table)
+library(Matrix)
+library(harmony)
+
+# parallelization
+# library(future)
+# plan("multiprocess", workers = 4)
+# options(future.globals.maxSize = 3000 * 1024^2)
+# plan()
+
+```
+
+```{r}
+# Load in cell cycle genes
+s_genes <- cc.genes$s.genes
+g2m_genes <- cc.genes$g2m.genes
+```
+
+```{r}
+# Load in raw gene expression matrices 
+# run in console not chunk
+HNSCC_371_neg.data <- Read10X("Run_2961/Sample_HN371doublenegative/filtered_feature_bc_matrix/")
+HNSCC_371_pos.data <- Read10X("Run_2961/Sample_HN371doublepositive/filtered_feature_bc_matrix/")
+HNSCC_372_neg.data <- Read10X("Run_2996/Sample_HN372_ALDHnegCD44neg/filtered_feature_bc_matrix/")
+HNSCC_372_pos.data <- Read10X("Run_2996/Sample_HN372_ALDHposCD44pos/filtered_feature_bc_matrix/")
+HNSCC_373_neg.data <- Read10X("Run_3048/Sample_HN373_ALDHnegCD44neg/filtered_feature_bc_matrix/")
+HNSCC_373_pos.data <- Read10X("Run_3048/Sample_HN373_ALDHposCD44pos/filtered_feature_bc_matrix/")
+HNSCC_375_neg.data <- Read10X("Run_3078/Sample_HN375neg/filtered_feature_bc_matrix/")
+HNSCC_375_pos.data <- Read10X("Run_3078/Sample_HN375pos/filtered_feature_bc_matrix/")
+HNSCC_378_neg.data <- Read10X("NovaA-138/Sample_HN378_ALDHnegCD44neg/filtered_feature_bc_matrix/")
+HNSCC_378_pos.data <- Read10X("NovaA-138/Sample_HN378_ALDHposCD44pos/filtered_feature_bc_matrix/")
+HNSCC_103_neg.data <- Read10X("NovaA-167/UMSCC103_neg/filtered_feature_bc_matrix/")
+HNSCC_103_pos.data <- Read10X("NovaA-167/UMSCC103_pos/filtered_feature_bc_matrix/")
+HNSCC_122_neg.data <- Read10X("NovaA-167/UMSCC122_neg/filtered_feature_bc_matrix/")
+HNSCC_122_pos.data <- Read10X("NovaA-167/UMSCC122_pos/filtered_feature_bc_matrix/")
+```
+
+```{r}
+# create Seurat obejcts
+HNSCC_371_neg <- CreateSeuratObject(counts = HNSCC_371_neg.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_371_pos <- CreateSeuratObject(counts = HNSCC_371_pos.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_372_neg <- CreateSeuratObject(counts = HNSCC_372_neg.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_372_pos <- CreateSeuratObject(counts = HNSCC_372_pos.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_373_neg <- CreateSeuratObject(counts = HNSCC_373_neg.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_373_pos <- CreateSeuratObject(counts = HNSCC_373_pos.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_375_neg <- CreateSeuratObject(counts = HNSCC_375_neg.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_375_pos <- CreateSeuratObject(counts = HNSCC_375_pos.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_378_neg <- CreateSeuratObject(counts = HNSCC_378_neg.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_378_pos <- CreateSeuratObject(counts = HNSCC_378_pos.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_103_neg <- CreateSeuratObject(counts = HNSCC_103_neg.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_103_pos <- CreateSeuratObject(counts = HNSCC_103_pos.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_122_neg <- CreateSeuratObject(counts = HNSCC_122_neg.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+HNSCC_122_pos <- CreateSeuratObject(counts = HNSCC_122_pos.data, project = 'HNSCC', min.cells = 3, min.features = 100)
+
+# merge objects together and rename cells
+HNSCC_merge <- merge(x = HNSCC_371_neg, y = c(HNSCC_371_pos, HNSCC_372_neg, HNSCC_372_pos, HNSCC_373_neg, 
+                                              HNSCC_373_pos, HNSCC_375_neg, HNSCC_375_pos, HNSCC_378_neg, 
+                                              HNSCC_378_pos, HNSCC_103_neg, HNSCC_103_pos, HNSCC_122_neg,
+                                              HNSCC_122_pos), 
+                     add.cell.ids = c('371_neg', '371_pos', '372_neg', '372_pos', '373_neg', '373_pos', 
+                                      '375_neg', '375_pos', '378_neg', '378_pos', '103_neg', '103_pos', 
+                                      '122_neg', '122_pos'))
+
+```
+
+```{r}
+# Add meta.data needed
+# get number of cells for each sample
+n_cells <- c(length(grep('^371_neg', colnames(HNSCC_merge))), length(grep('^371_pos', colnames(HNSCC_merge))),
+             length(grep('^372_neg', colnames(HNSCC_merge))), length(grep('^372_pos', colnames(HNSCC_merge))),
+             length(grep('^373_neg', colnames(HNSCC_merge))), length(grep('^373_pos', colnames(HNSCC_merge))),
+             length(grep('^375_neg', colnames(HNSCC_merge))), length(grep('^375_pos', colnames(HNSCC_merge))),
+             length(grep('^378_neg', colnames(HNSCC_merge))), length(grep('^378_pos', colnames(HNSCC_merge))),
+             length(grep('^103_neg', colnames(HNSCC_merge))), length(grep('^103_pos', colnames(HNSCC_merge))),
+             length(grep('^122_neg', colnames(HNSCC_merge))), length(grep('^122_pos', colnames(HNSCC_merge))))
+
+metadata <- data.frame(run = rep(c('2961', '2961', '2996', '2996', '3048', '3048', '3078', '3078', '138',
+                                   '138', '167', '167', '167', '167'), times = n_cells),
+                       state = rep(c('neg', 'pos', 'neg', 'pos', 'neg', 'pos', 'neg', 'pos', 'neg', 'pos', 
+                                     'neg', 'pos', 'neg', 'pos'), times = n_cells),
+                       ID = rep(c('371', '371', '372', '372', '373', '373', '375', '375', '378', '378',
+                                  '103', '103', '122', '122'), times = n_cells), 
+                       row.names = colnames(HNSCC_merge), stringsAsFactors = F)
+
+# add metadata to merged object
+HNSCC_merge <- AddMetaData(HNSCC_merge, metadata = metadata)
+
+```
+
+```{r}
+# Save raw object 
+# Run in console not chunk
+save(HNSCC_merge, file = 'HNSCC_merge_v4_raw_010920.RData')
+
+# Remove objects by environment (OPTIONAL)
+```
+
+
+# PREPROCESSING
+## QC/Filtering
+```{r}
+# get percent of mitochondrial genes reads
+HNSCC_merge$percent.mt <- PercentageFeatureSet(object = HNSCC_merge, pattern = "^MT-")
+
+# Look at nFeature, nCount, percent.mt
+VlnPlot(object = HNSCC_merge, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3,
+        pt.size = .5)
+
+plot1 <- FeatureScatter(object = HNSCC_merge, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(object = HNSCC_merge, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+CombinePlots(plots = list(plot1, plot2))
+```
+
+```{r}
+# Filter cells
+HNSCC_merge <- subset(x = HNSCC_merge, subset = nCount_RNA < 2e+05 & nFeature_RNA < 10000 & percent.mt < 50)
+```
+
+## Normalization
+```{r}
+# Normalize merged data
+HNSCC_merge <- NormalizeData(object = HNSCC_merge, normalization.method = "LogNormalize", 
+                             scale.factor = 10000)
+```
+
+## Variable Feature Selection
+```{r}
+# Find variable features
+HNSCC_merge <- FindVariableFeatures(object = HNSCC_merge, selection.method = 'vst', loess.span = .3,
+                                    nfeatures = 2000)
+top10 <- head(x = VariableFeatures(object = HNSCC_merge), 10)
+
+plot1 <- VariableFeaturePlot(object = HNSCC_merge)
+plot2 <- LabelPoints(plot = plot1, points = top10)
+CombinePlots(plots = list(plot1, plot2))
+```
+
+## Scaling
+```{r}
+# Scale the data
+all.genes <- rownames(HNSCC_merge)
+# use if want all cell cycle signals regressed out
+HNSCC_merge <- CellCycleScoring(object = HNSCC_merge, s.features = s_genes, g2m.features = g2m_genes, set.ident = TRUE)
+HNSCC_merge <- ScaleData(object = HNSCC_merge, features = all.genes, 
+                         vars.to.regress = c("nCount_RNA", "nFeature_RNA", "percent.mt", "S.Score", "G2M.Score"))
+
+```
+
+## PCA
+```{r}
+# Can control the number of pcs that you want to calculate w/ npcs
+HNSCC_merge <- RunPCA(object = HNSCC_merge, features = VariableFeatures(object = HNSCC_merge), 
+                      nfeatures.print = 5)
+
+# Choosing how many PCs for clustering
+# visualizing pcs
+ElbowPlot(object = HNSCC_merge, ndims = 50)
+
+# Calculating --> until get over 90% variance
+stdev <- HNSCC_merge[['pca']]@stdev
+var <- (HNSCC_merge[['pca']]@stdev)^2
+sum(var[1:31])/sum(var) 
+
+pc_n <- 31
+```
+
+## Batch Correction
+```{r}
+# Batch correction with Harmony
+HNSCC_merge <- RunHarmony(HNSCC_merge, group.by.vars = c('run'), dims.use = 1:pc_n, verbose = F)
+```
+
+## Clustering
+```{r}
+HNSCC_merge <- FindNeighbors(object = HNSCC_merge, dims = 1:pc_n, k.param = 20, reduction = 'harmony')
+HNSCC_merge <- FindClusters(object = HNSCC_merge, resolution = 0.5)
+```
+
+## UMAP
+```{r}
+HNSCC_merge <- RunUMAP(HNSCC_merge, dims = 1:pc_n, reduction = 'harmony')
+DimPlot(object = HNSCC_merge, reduction = 'umap')
+```
+
+```{r}
+# Save filtered object
+# Run in console not chunk
+save(HNSCC_merge, file = 'HNSCC_merge_v4_filtered_010920.RData')
+```
+
+
+# DOWNSTREAM ANALYSIS
+## More UMAP visualizations
+```{r}
+DimPlot(object = HNSCC_merge, reduction = 'umap', label = T, label.size = 5)
+DimPlot(object = HNSCC_merge, reduction = 'umap', group.by = 'run')
+DimPlot(object = HNSCC_merge, reduction = 'umap', split.by = 'state')
+```
+
+## Cell type annotation
+```{r}
+# DE
+HNSCC_DE <- FindAllMarkers(object = HNSCC_merge, only.pos = T)
+HNSCC_DE <- HNSCC_DE[which(HNSCC_DE$p_val_adj < .05),]
+fwrite(HNSCC_DE, file = 'HNSCC_DE_clusters_annote_011020.csv') # run in console
+```
+
+
