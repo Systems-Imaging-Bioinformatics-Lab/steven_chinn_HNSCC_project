@@ -4,7 +4,7 @@ Data analysis on Head and Neck Stem Cell Cancer (HNSCC) project with Molly Heft 
 Two main analyses:
 1) Primary tumor analysis
     - scRNA: processing, cell scoring, and CNV
-    - bulk-RNA: processing
+    - bulk-RNA: processing (only DE)
 2) Cell lines analysis 
     - scRNA: processing and cell scoring
 
