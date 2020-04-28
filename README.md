@@ -1,4 +1,4 @@
-# steven_chinn_HNSCC_project
+# HNSCC Project
 
 Data analysis on Head and Neck Stem Cell Cancer (HNSCC) project with Molly Heft Neal and Steven Chinn. Analysis was done by Stephanie The.  
 Two main analyses:
